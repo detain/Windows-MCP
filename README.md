@@ -737,6 +737,11 @@ MCP Client can access the following tools to interact with Windows:
 - `Notification`: Send a Windows toast notification with a title and message.
 - `Registry`: Read, write, delete, or list Windows Registry values and keys.
 - `TextCursor`: Inspect or manipulate the caret/selection of the focused text control via UIA — read caret/selection info, move the caret (relative or absolute), select a text range, select all, or collapse a selection. Requires a control that exposes the UIA TextPattern.
+- `WaitForUACPrompt`: Block until a UAC consent prompt fires on the Secure Desktop, then
+  return the dialog's UIA tree, the verified publisher (when detectable), and the active
+  consent policy. Use it right after triggering an operation you expect to need elevation.
+  Requires the LocalSystem host service (`windows-mcp service secure-desktop install`,
+  Administrator); without it the tool returns an explanatory error rather than blocking.
 
 
 ## 🤝 Connect with Us
