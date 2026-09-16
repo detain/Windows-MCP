@@ -741,7 +741,8 @@ MCP Client can access the following tools to interact with Windows:
   return the dialog's UIA tree, the verified publisher (when detectable), and the active
   consent policy. Use it right after triggering an operation you expect to need elevation.
   Requires the LocalSystem host service (`windows-mcp service secure-desktop install`,
-  Administrator); without it the tool returns an explanatory error rather than blocking.
+  Administrator); without it the tool raises rather than blocking. Like `WaitFor`, it
+  raises a timeout error when no prompt appears within `timeout_ms`.
 
 
 ## 🤝 Connect with Us

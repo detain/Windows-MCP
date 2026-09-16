@@ -193,8 +193,8 @@ def test_wait_for_uac_prompt_host_call_failure_is_error_true(monkeypatch, mcp):
     assert error_msg in str(exc_info.value)
 
 
-def test_wait_for_uac_prompt_timeout_is_not_an_error(monkeypatch, mcp):
-    """No prompt firing is a legitimate observation, not a tool failure."""
+def test_wait_for_uac_prompt_timeout_is_error_true(monkeypatch, mcp):
+    """No prompt firing must raise, the way WaitFor raises on an unmet condition."""
     from windows_mcp import service as service_pkg
     from windows_mcp.tools.uac import register as uac_tool_reg
 
@@ -209,6 +209,6 @@ def test_wait_for_uac_prompt_timeout_is_not_an_error(monkeypatch, mcp):
 
     monkeypatch.setattr(service_pkg, "get_host_client", lambda: _Quiet())
 
-    result = asyncio.run(mcp.call_tool("WaitForUACPrompt", {"timeout_ms": 1000}))
-    assert result.structured_content["ok"] is True
-    assert result.structured_content["fired"] is False
+    with pytest.raises(ToolError) as exc_info:
+        asyncio.run(mcp.call_tool("WaitForUACPrompt", {"timeout_ms": 1000}))
+    assert "Timed out after 1.00s" in str(exc_info.value)

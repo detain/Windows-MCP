@@ -10,8 +10,8 @@ this tool raises rather than silently blocking — the broker cannot see the
 Secure Desktop on its own.
 
 Failures raise ``ToolError`` so FastMCP sets ``isError=true`` on the wire.
-A timeout is not a failure: no prompt firing is a legitimate observation and
-comes back as a successful ``fired: False`` result.
+A timeout raises ``TimeoutError``, matching the ``WaitFor`` tool, which also
+raises when its condition never holds.
 """
 
 from __future__ import annotations
@@ -74,8 +74,10 @@ def register(mcp, *, get_desktop, get_analytics):
         except Exception as exc:
             raise ToolError(f"Host service call failed: {exc}") from exc
         if result is None:
-            # Not an error: the operation simply never asked for elevation.
-            return {"ok": True, "fired": False, "reason": "timeout"}
+            raise TimeoutError(
+                f"Timed out after {timeout_ms / 1000:.2f}s waiting for a UAC consent "
+                "prompt: none appeared. The operation may not have required elevation."
+            )
         try:
             pol = client.policy_state()
         except Exception:

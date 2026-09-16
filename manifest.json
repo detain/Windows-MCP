@@ -161,7 +161,7 @@
     },
     {
       "name": "WaitForUACPrompt",
-      "description": "Blocks until a UAC consent prompt appears on the Secure Desktop, then returns the dialog as a UIA tree plus the verified publisher when detectable, along with the active consent policy. Use after triggering an operation expected to require elevation. Requires the LocalSystem host service installed via `windows-mcp service secure-desktop install`; without it the tool returns an explanatory error instead of blocking."
+      "description": "Blocks until a UAC consent prompt appears on the Secure Desktop, then returns the dialog as a UIA tree plus the verified publisher when detectable, along with the active consent policy. Use after triggering an operation expected to require elevation. Requires the LocalSystem host service installed via `windows-mcp service secure-desktop install`. Raises rather than blocking when the host service is missing or the pipe call fails, and raises a timeout error when no prompt appears within timeout_ms."
     }
   ],
   "compatibility": {
