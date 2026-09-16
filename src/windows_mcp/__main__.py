@@ -759,7 +759,7 @@ def _gen_tls(host: str, cert_path, key_path) -> None:
     mkcert = subprocess.run(["where", "mkcert"], capture_output=True).returncode == 0
 
     if mkcert:
-        click.echo("mkcert detected — generating a locally-trusted certificate...")
+        click.echo("mkcert detected -- generating a locally-trusted certificate...")
         install = subprocess.run(["mkcert", "-install"], capture_output=True, text=True)
         if install.returncode != 0:
             raise click.ClickException(f"mkcert -install failed:\n{install.stderr.strip()}")
@@ -781,7 +781,7 @@ def _gen_tls(host: str, cert_path, key_path) -> None:
             raise click.ClickException(f"mkcert failed:\n{result.stderr.strip()}")
         click.echo("  Certificate is automatically trusted by Windows.")
     else:
-        click.echo("mkcert not found — falling back to openssl (self-signed)...")
+        click.echo("mkcert not found -- falling back to openssl (self-signed)...")
         click.echo("  Tip: winget install FiloSottile.mkcert  for auto-trusted certs next time.")
         result = subprocess.run(
             [
@@ -810,8 +810,8 @@ def _gen_tls(host: str, cert_path, key_path) -> None:
             f'    Import-Certificate -FilePath "{cert_path}" -CertStoreLocation Cert:\\LocalMachine\\Root'
         )
 
-    click.echo(f"  cert → {cert_path}")
-    click.echo(f"  key  → {key_path}")
+    click.echo(f"  cert -> {cert_path}")
+    click.echo(f"  key  -> {key_path}")
 
 
 _TASK_NAME = "windows-mcp-server"
@@ -898,7 +898,7 @@ def install(transport: str, host: str, port: int, force: bool) -> None:
             f"schtasks /Run failed:\n{run_result.stderr.strip() or run_result.stdout.strip()}"
         )
 
-    click.echo("Scheduled task installed — server is starting now.")
+    click.echo("Scheduled task installed -- server is starting now.")
     click.echo(f"  Task      : {_TASK_NAME}")
     click.echo(f"  Transport : {transport}")
     click.echo(f"  Address   : {host}:{port}")
@@ -1031,6 +1031,473 @@ def auth(transport: str, host: str, port: int, with_tls: bool, force: bool) -> N
   }}
 }}"""
         )
+
+
+# ---------------------------------------------------------------------------
+# `windows-mcp service secure-desktop` command group
+# ---------------------------------------------------------------------------
+
+_SERVICE_NAME = "WindowsMCPHost"
+_SERVICE_DISPLAY = "Windows MCP Host"
+
+
+def _require_win32():
+    try:
+        import win32serviceutil  # noqa: F401
+    except ImportError:
+        raise click.ClickException(
+            "pywin32 is required for service management.  Install it with: pip install pywin32"
+        )
+
+
+def _admin_only_prefixes() -> list[str]:
+    """Paths under which Windows defaults to admin-only write access."""
+    return [
+        os.environ.get("ProgramFiles", r"C:\Program Files"),
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+        os.environ.get("SystemRoot", r"C:\Windows"),
+    ]
+
+
+def _path_is_admin_only(path: str) -> bool:
+    """Return True if *path* lives under a default admin-only prefix.
+
+    This is a *heuristic*, not a permission check -- but it covers 99% of
+    real installs.  Users on truly custom layouts can override with
+    --allow-user-binary-path.
+    """
+    norm = os.path.normcase(os.path.normpath(path))
+    for prefix in _admin_only_prefixes():
+        if not prefix:
+            continue
+        prefix_norm = os.path.normcase(os.path.normpath(prefix))
+        if norm.startswith(prefix_norm + os.sep) or norm == prefix_norm:
+            return True
+    return False
+
+
+_UAC_POLICY_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+
+
+def _set_uac_secure_desktop_off(off: bool) -> tuple[int, int]:
+    """Toggle the UAC secure-desktop policy. Returns the (POSD, CPB) readback
+    so callers can verify the writes stuck.
+
+    off=True  -> POSD=0, CPB=4 (UAC on Default desktop).
+    off=False -> POSD=1, CPB=5 (modern Win 11 default).
+
+    CPB=4 specifically (not 5) is needed on Win 11 25H2 -- see
+    docs/win11-uac-investigation.md iter-7 vs iter-8.
+    """
+    import winreg
+
+    posd_target = 0 if off else 1
+    cpba_target = 4 if off else 5
+
+    with winreg.OpenKey(
+        winreg.HKEY_LOCAL_MACHINE,
+        _UAC_POLICY_KEY,
+        access=winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE,
+    ) as key:
+        winreg.SetValueEx(key, "PromptOnSecureDesktop", 0, winreg.REG_DWORD, posd_target)
+        winreg.SetValueEx(key, "ConsentPromptBehaviorAdmin", 0, winreg.REG_DWORD, cpba_target)
+        posd, _ = winreg.QueryValueEx(key, "PromptOnSecureDesktop")
+        cpba, _ = winreg.QueryValueEx(key, "ConsentPromptBehaviorAdmin")
+    return int(posd), int(cpba)
+
+
+def _verify_install_paths_are_admin_only() -> None:
+    """Raise ClickException if the Python interpreter or windows_mcp package live
+    in a user-writable location.
+
+    The Windows SCM will launch the binary path as SYSTEM.  If any component
+    of that path is under user-writable storage (a uv tool cache, a venv in
+    %LOCALAPPDATA%, a per-user pip install), then any process running as the
+    user can replace files there and gain SYSTEM the next time the service
+    starts.  Refuse the install rather than register an unsafe service.
+    """
+    import windows_mcp
+
+    py_exe = sys.executable
+    pkg_path = os.path.dirname(os.path.abspath(windows_mcp.__file__))
+
+    unsafe: list[str] = []
+    if not _path_is_admin_only(py_exe):
+        unsafe.append(f"  Python interpreter : {py_exe}")
+    if not _path_is_admin_only(pkg_path):
+        unsafe.append(f"  windows_mcp package: {pkg_path}")
+
+    if not unsafe:
+        return
+
+    raise click.ClickException(
+        "Refusing to install the LocalSystem service: the binary path lives in a\n"
+        "user-writable location.  Anyone who can write to that path will obtain\n"
+        "SYSTEM the next time the service starts.\n\n" + "\n".join(unsafe) + "\n\n"
+        "Install Python system-wide (e.g. `winget install Python.Python.3.13`,\n"
+        "which lands under %ProgramFiles%) and then `pip install windows-mcp`\n"
+        "into that system Python.  Re-run this command.\n\n"
+        "If you accept the risk (e.g. testing inside a disposable VM), pass\n"
+        "--allow-user-binary-path."
+    )
+
+
+def _sc_state_name(state: int) -> str:
+    import win32service
+
+    return {
+        win32service.SERVICE_STOPPED: "STOPPED",
+        win32service.SERVICE_START_PENDING: "START_PENDING",
+        win32service.SERVICE_STOP_PENDING: "STOP_PENDING",
+        win32service.SERVICE_RUNNING: "RUNNING",
+        win32service.SERVICE_CONTINUE_PENDING: "CONTINUE_PENDING",
+        win32service.SERVICE_PAUSE_PENDING: "PAUSE_PENDING",
+        win32service.SERVICE_PAUSED: "PAUSED",
+    }.get(state, f"UNKNOWN({state})")
+
+
+@main.group()
+def service():
+    """Manage Windows MCP optional privileged services.
+
+    Privileged services run as NT AUTHORITY\\SYSTEM and expose a local named
+    pipe to the user-mode broker.  They are opt-in because they require
+    elevation to install.
+
+    Sub-groups:
+
+      secure-desktop   Host service that lets the agent see and click UAC
+                       consent prompts (Secure Desktop / Winlogon).
+    """
+
+
+@service.group("secure-desktop")
+def service_secure_desktop():
+    """Manage the Secure Desktop host service (handles UAC consent prompts).
+
+    The host service runs as NT AUTHORITY\\SYSTEM and exposes a local named pipe
+    so the MCP broker can capture screenshots and route input across the
+    Winlogon (Secure Desktop) boundary that fires during UAC consent prompts.
+
+    UAC remains fully enabled -- the service does NOT weaken the Secure Desktop
+    policy.  Whether the broker may auto-click a UAC prompt is governed by the
+    ``WINDOWS_MCP_SECURE_DESKTOP_POLICY`` env var (``block`` by default).
+
+    Must be installed once from an elevated (Administrator) prompt:
+
+        uv run windows-mcp service secure-desktop install
+    """
+
+
+@service_secure_desktop.command("install")
+@click.option("--force", is_flag=True, help="Uninstall then reinstall if already present.")
+@click.option(
+    "--policy",
+    type=click.Choice(["block", "allow_with_match", "allow_all"]),
+    default=None,
+    help=(
+        "Persist a Secure Desktop consent policy on install. "
+        "If omitted, falls back to WINDOWS_MCP_SECURE_DESKTOP_POLICY, "
+        "then config.toml, then 'block'."
+    ),
+)
+@click.option(
+    "--allow-publisher",
+    "allow_publisher",
+    multiple=True,
+    help=(
+        "Publisher substring to allow under --policy=allow_with_match. "
+        "Repeat to add multiple. Comma-separated also works."
+    ),
+)
+@click.option(
+    "--allow-user-binary-path",
+    is_flag=True,
+    default=False,
+    help=(
+        "Allow installing even if Python or windows_mcp live in a user-writable "
+        "location. Unsafe outside a disposable VM -- any local process running as "
+        "the user can replace the binary and gain SYSTEM at next service start."
+    ),
+)
+def service_secure_desktop_install(
+    force: bool,
+    policy: str | None,
+    allow_publisher: tuple[str, ...],
+    allow_user_binary_path: bool,
+):
+    """Install and start the Secure Desktop host service (requires elevation)."""
+    _require_win32()
+    import win32serviceutil
+    import win32service
+    import pywintypes
+    from windows_mcp.service.host import WindowsMCPHostService
+    from windows_mcp.service import policy as policy_mod
+
+    if not allow_user_binary_path:
+        _verify_install_paths_are_admin_only()
+    else:
+        click.echo(
+            "WARNING: --allow-user-binary-path was passed. The service binary "
+            "path may be user-writable, which is a privilege-escalation risk. "
+            "Use only in disposable VMs."
+        )
+
+    # Resolve effective policy: CLI flag > env var > config.toml > default ("block").
+    cfg = load_config(discover_config_path(None))
+    cli_allowlist: list[str] = []
+    for raw in allow_publisher:
+        cli_allowlist.extend(s.strip() for s in raw.split(",") if s.strip())
+    effective_policy = policy_mod.resolve_install_time_policy(
+        cli_policy=policy,
+        cli_allowlist=cli_allowlist or None,
+        config_policy=cfg.secure_desktop.policy,
+        config_allowlist=cfg.secure_desktop.publishers_allowlist,
+    )
+
+    # Check whether the service already exists.
+    already_installed = False
+    try:
+        win32serviceutil.QueryServiceStatus(_SERVICE_NAME)
+        already_installed = True
+    except pywintypes.error:
+        pass
+
+    if already_installed:
+        if not force:
+            click.echo(f"Service '{_SERVICE_NAME}' is already installed.")
+            click.echo("Use --force to uninstall and reinstall it.")
+            return
+        # --force: tear down the old registration first.
+        click.echo("Removing existing service registration...")
+        try:
+            win32serviceutil.StopService(_SERVICE_NAME)
+        except Exception:
+            pass
+        try:
+            win32serviceutil.RemoveService(_SERVICE_NAME)
+        except Exception as exc:
+            raise click.ClickException(f"Failed to remove existing service: {exc}")
+
+    # Register the service using win32service.CreateService directly so we
+    # can specify sys.executable as the binary.  This is critical when
+    # windows-mcp is installed in a venv: pywin32's PythonService.exe runs
+    # against the system Python and cannot import windows_mcp, causing 1053.
+    # Using sys.executable guarantees the exact interpreter that has the
+    # package is what the SCM launches.
+    binary_path = f'"{sys.executable}" -m windows_mcp.service.host'
+
+    hscm = None
+    hs = None
+    try:
+        hscm = win32service.OpenSCManager(None, None, win32service.SC_MANAGER_CREATE_SERVICE)
+        hs = win32service.CreateService(
+            hscm,
+            _SERVICE_NAME,
+            _SERVICE_DISPLAY,
+            win32service.SERVICE_ALL_ACCESS,
+            win32service.SERVICE_WIN32_OWN_PROCESS,
+            win32service.SERVICE_AUTO_START,
+            win32service.SERVICE_ERROR_NORMAL,
+            binary_path,
+            None,  # load order group
+            0,  # tag id
+            None,  # dependencies
+            None,  # service account -> LocalSystem
+            None,  # password
+        )
+        win32service.ChangeServiceConfig2(
+            hs,
+            win32service.SERVICE_CONFIG_DESCRIPTION,
+            WindowsMCPHostService._svc_description_,
+        )
+    except pywintypes.error as exc:
+        raise click.ClickException(f"Failed to install service: {exc}")
+    finally:
+        if hs:
+            win32service.CloseServiceHandle(hs)
+        if hscm:
+            win32service.CloseServiceHandle(hscm)
+
+    click.echo(f"Service '{_SERVICE_NAME}' installed.")
+    click.echo(f"  Binary : {binary_path}")
+
+    try:
+        win32serviceutil.StartService(_SERVICE_NAME)
+        click.echo(f"Service '{_SERVICE_NAME}' started.")
+    except pywintypes.error as exc:
+        # 1056 = service is already running
+        if exc.winerror == 1056:
+            click.echo(f"Service '{_SERVICE_NAME}' is already running.")
+        else:
+            raise click.ClickException(f"Failed to start service: {exc}")
+
+    try:
+        policy_mod.write_to_registry(effective_policy)
+        click.echo(f"UAC consent policy : {effective_policy.policy}")
+        if effective_policy.publishers_allowlist:
+            click.echo(f"  publishers allowlist: {effective_policy.publishers_allowlist}")
+    except Exception as exc:
+        click.echo(f"Warning: could not persist UAC policy: {exc}")
+        click.echo("         Service will refuse auto-clicks until policy is set.")
+
+    # Route UAC to the user's Default desktop. Without this every UAC
+    # prompt lands on Winlogon where consent.exe is unreachable from
+    # user-mode UIA (see docs/win11-uac-investigation.md). Restored on
+    # uninstall.
+    try:
+        posd, cpba = _set_uac_secure_desktop_off(True)
+        if posd == 0 and cpba == 4:
+            click.echo(
+                "UAC policy         : PromptOnSecureDesktop=0, ConsentPromptBehaviorAdmin=4 "
+                "(UAC will render on Default desktop)."
+            )
+        else:
+            click.echo(
+                f"Warning: UAC policy writes did not stick: readback PromptOnSecureDesktop={posd}, "
+                f"ConsentPromptBehaviorAdmin={cpba}. Group Policy or another layer is "
+                "overriding the registry values."
+            )
+    except Exception as exc:
+        click.echo(f"Warning: could not disable secure-desktop UAC policy: {exc}")
+        click.echo(
+            "         UAC will continue to render on the Secure Desktop, where the "
+            "dialog is unreachable from user-mode UIA on Win11. WaitForUACPrompt "
+            "will return an empty tree."
+        )
+
+    click.echo("\nThe host service is now running as NT AUTHORITY\\SYSTEM.")
+    click.echo("It will restart automatically at each boot.")
+    click.echo(
+        "Run `windows-mcp service secure-desktop set-policy <policy>` to change without reinstalling."
+    )
+    click.echo("Run `windows-mcp service secure-desktop uninstall` to remove it.")
+
+
+@service_secure_desktop.command("uninstall")
+def service_secure_desktop_uninstall():
+    """Stop and remove the Secure Desktop host service (requires elevation)."""
+    _require_win32()
+    import win32serviceutil
+    import pywintypes
+
+    try:
+        win32serviceutil.StopService(_SERVICE_NAME)
+        click.echo(f"Service '{_SERVICE_NAME}' stopped.")
+    except pywintypes.error:
+        pass  # Not running -- that's fine
+
+    try:
+        win32serviceutil.RemoveService(_SERVICE_NAME)
+        click.echo(f"Service '{_SERVICE_NAME}' removed.")
+    except pywintypes.error as exc:
+        raise click.ClickException(f"Failed to remove service: {exc}")
+
+    try:
+        from windows_mcp.service import policy as policy_mod
+
+        policy_mod.delete_from_registry()
+        click.echo("UAC consent policy : cleared from registry.")
+    except Exception as exc:
+        click.echo(f"Warning: could not clear UAC policy registry key: {exc}")
+
+    try:
+        _set_uac_secure_desktop_off(False)
+        click.echo(
+            "UAC policy         : PromptOnSecureDesktop=1, ConsentPromptBehaviorAdmin=5 "
+            "(Secure Desktop restored)."
+        )
+    except Exception as exc:
+        click.echo(f"Warning: could not restore UAC secure-desktop policy: {exc}")
+
+
+@service_secure_desktop.command("set-policy")
+@click.argument("policy_name", type=click.Choice(["block", "allow_with_match", "allow_all"]))
+@click.option(
+    "--allow-publisher",
+    "allow_publisher",
+    multiple=True,
+    help="Publisher substring(s) for allow_with_match. Repeat or comma-separate.",
+)
+def service_secure_desktop_set_policy(policy_name: str, allow_publisher: tuple[str, ...]):
+    """Update the persisted Secure Desktop consent policy without reinstalling."""
+    _require_win32()
+    from windows_mcp.service import policy as policy_mod
+
+    allowlist: list[str] = []
+    for raw in allow_publisher:
+        allowlist.extend(s.strip() for s in raw.split(",") if s.strip())
+    new_policy = policy_mod.SecureDesktopPolicy(policy=policy_name, publishers_allowlist=allowlist)
+    try:
+        policy_mod.write_to_registry(new_policy)
+    except PermissionError as exc:
+        raise click.ClickException(
+            f"Permission denied writing policy to HKLM: {exc}.  Run as Administrator."
+        )
+    except Exception as exc:
+        raise click.ClickException(f"Failed to write policy: {exc}")
+    click.echo(f"Policy updated -> {policy_name}")
+    if allowlist:
+        click.echo(f"  publishers allowlist: {allowlist}")
+
+
+@service_secure_desktop.command("start")
+def service_secure_desktop_start():
+    """Start the Secure Desktop host service."""
+    _require_win32()
+    import win32serviceutil
+
+    try:
+        win32serviceutil.StartService(_SERVICE_NAME)
+        click.echo(f"Service '{_SERVICE_NAME}' started.")
+    except Exception as exc:
+        raise click.ClickException(f"Failed to start service: {exc}")
+
+
+@service_secure_desktop.command("stop")
+def service_secure_desktop_stop():
+    """Stop the Secure Desktop host service."""
+    _require_win32()
+    import win32serviceutil
+
+    try:
+        win32serviceutil.StopService(_SERVICE_NAME)
+        click.echo(f"Service '{_SERVICE_NAME}' stopped.")
+    except Exception as exc:
+        raise click.ClickException(f"Failed to stop service: {exc}")
+
+
+@service_secure_desktop.command("status")
+def service_secure_desktop_status():
+    """Show the current status of the Secure Desktop host service."""
+    _require_win32()
+    import win32serviceutil
+    import win32service
+    import pywintypes
+
+    try:
+        status = win32serviceutil.QueryServiceStatus(_SERVICE_NAME)
+        state = _sc_state_name(status[1])
+        click.echo(f"Service : {_SERVICE_NAME}")
+        click.echo(f"Status  : {state}")
+
+        # Also check pipe reachability from the broker side.
+        if status[1] == win32service.SERVICE_RUNNING:
+            try:
+                from windows_mcp.service.pipe import get_client
+
+                client = get_client()
+                client.invalidate_cache()
+                if client.is_available():
+                    desktop = client.desktop_name()
+                    click.echo("Pipe    : reachable")
+                    click.echo(f"Desktop : {desktop}")
+                else:
+                    click.echo("Pipe    : not reachable (service may still be starting)")
+            except Exception as exc:
+                click.echo(f"Pipe    : error -- {exc}")
+    except pywintypes.error:
+        click.echo(f"Service '{_SERVICE_NAME}' is not installed.")
 
 
 if __name__ == "__main__":

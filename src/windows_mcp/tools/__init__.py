@@ -15,6 +15,7 @@ from windows_mcp.tools import (
     shell,
     snapshot,
     text_cursor,
+    uac,
 )
 
 _MODULES = [
@@ -32,6 +33,7 @@ _MODULES = [
     notification,
     registry,
     text_cursor,
+    uac,
 ]
 
 
