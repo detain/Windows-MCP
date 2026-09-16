@@ -6,8 +6,12 @@ agent can decide whether to approve it.
 
 Requires the LocalSystem host service to be installed
 (``uv run windows-mcp service secure-desktop install``). Without the service,
-this tool returns an explanatory error rather than silently blocking — the
-broker cannot see the Secure Desktop on its own.
+this tool raises rather than silently blocking — the broker cannot see the
+Secure Desktop on its own.
+
+Failures raise ``ToolError`` so FastMCP sets ``isError=true`` on the wire.
+A timeout is not a failure: no prompt firing is a legitimate observation and
+comes back as a successful ``fired: False`` result.
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ from __future__ import annotations
 from typing import Annotated
 
 from fastmcp import Context
+from fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
@@ -58,20 +63,18 @@ def register(mcp, *, get_desktop, get_analytics):
 
         client = get_host_client()
         if not client.is_available():
-            return {
-                "ok": False,
-                "error": (
-                    "Windows-MCP Secure Desktop host service is not installed or not "
-                    "running. Install it with: "
-                    "`uv run windows-mcp service secure-desktop install` "
-                    "(requires Administrator)."
-                ),
-            }
+            raise ToolError(
+                "Windows-MCP Secure Desktop host service is not installed or not "
+                "running. Install it with: "
+                "`uv run windows-mcp service secure-desktop install` "
+                "(requires Administrator)."
+            )
         try:
             result = client.wait_for_uac_prompt(timeout_ms=timeout_ms)
         except Exception as exc:
-            return {"ok": False, "error": f"Host service call failed: {exc}"}
+            raise ToolError(f"Host service call failed: {exc}") from exc
         if result is None:
+            # Not an error: the operation simply never asked for elevation.
             return {"ok": True, "fired": False, "reason": "timeout"}
         try:
             pol = client.policy_state()

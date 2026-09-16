@@ -151,3 +151,64 @@ def test_text_cursor_verification_failure_raises(monkeypatch):
     assert "move_absolute" in str(exc_info.value)
     assert "target_offset_units" in str(exc_info.value)
     assert "'caret_offset_units': 3" in str(exc_info.value)
+
+
+def test_wait_for_uac_prompt_unavailable_service_is_error_true(monkeypatch, mcp):
+    """A missing host service must surface as ToolError, not an ok=False payload."""
+    from windows_mcp import service as service_pkg
+    from windows_mcp.tools.uac import register as uac_tool_reg
+
+    uac_tool_reg(mcp, get_desktop=lambda: None, get_analytics=lambda: None)
+
+    class _Unavailable:
+        def is_available(self):
+            return False
+
+    monkeypatch.setattr(service_pkg, "get_host_client", lambda: _Unavailable())
+
+    with pytest.raises(ToolError) as exc_info:
+        asyncio.run(mcp.call_tool("WaitForUACPrompt", {"timeout_ms": 1000}))
+    assert "secure-desktop install" in str(exc_info.value)
+
+
+def test_wait_for_uac_prompt_host_call_failure_is_error_true(monkeypatch, mcp):
+    """A failing pipe call must surface as ToolError, not an ok=False payload."""
+    from windows_mcp import service as service_pkg
+    from windows_mcp.tools.uac import register as uac_tool_reg
+
+    uac_tool_reg(mcp, get_desktop=lambda: None, get_analytics=lambda: None)
+    error_msg = "pipe broken"
+
+    class _Failing:
+        def is_available(self):
+            return True
+
+        def wait_for_uac_prompt(self, timeout_ms):  # noqa: ARG002
+            raise RuntimeError(error_msg)
+
+    monkeypatch.setattr(service_pkg, "get_host_client", lambda: _Failing())
+
+    with pytest.raises(ToolError) as exc_info:
+        asyncio.run(mcp.call_tool("WaitForUACPrompt", {"timeout_ms": 1000}))
+    assert error_msg in str(exc_info.value)
+
+
+def test_wait_for_uac_prompt_timeout_is_not_an_error(monkeypatch, mcp):
+    """No prompt firing is a legitimate observation, not a tool failure."""
+    from windows_mcp import service as service_pkg
+    from windows_mcp.tools.uac import register as uac_tool_reg
+
+    uac_tool_reg(mcp, get_desktop=lambda: None, get_analytics=lambda: None)
+
+    class _Quiet:
+        def is_available(self):
+            return True
+
+        def wait_for_uac_prompt(self, timeout_ms):  # noqa: ARG002
+            return None
+
+    monkeypatch.setattr(service_pkg, "get_host_client", lambda: _Quiet())
+
+    result = asyncio.run(mcp.call_tool("WaitForUACPrompt", {"timeout_ms": 1000}))
+    assert result.structured_content["ok"] is True
+    assert result.structured_content["fired"] is False
